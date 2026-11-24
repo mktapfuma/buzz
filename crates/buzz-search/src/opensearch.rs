@@ -1,7 +1,8 @@
 //! The OpenSearch message index: layout, writes and searches.
 //!
 //! One alias, `{prefix}messages`, points at the index of the mapping version
-//! this code writes, `{prefix}messages-v1`. A document is one message, with
+//! this code writes, `{prefix}messages-v{MAPPING_VERSION}`; text analysis
+//! and ranking are in [`relevance`]. A document is one message, with
 //! id `community:event_id`. Documents are routed by id, so messages spread
 //! evenly over shards, and every search filters on the community first: that
 //! filter, not routing, is the multi-tenant fence.
@@ -9,6 +10,8 @@
 //! Message text is indexed but not kept in the stored document source. The
 //! relay re-reads every hit from Postgres, so the index holds only what search
 //! needs.
+
+mod relevance;
 
 use std::ops::Range;
 use std::time::Duration;
@@ -20,19 +23,23 @@ use opensearch::http::response::Response;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::http::Url;
 use opensearch::indices::IndicesRefreshParts;
-use opensearch::indices::{IndicesCreateParts, IndicesDeleteParts, IndicesExistsParts};
+use opensearch::indices::{IndicesCreateParts, IndicesDeleteParts, IndicesGetAliasParts};
 use opensearch::params::VersionType;
 use opensearch::{BulkOperation, BulkParts, OpenSearch, SearchParts};
 use serde_json::{json, Value};
 
 use crate::query::{normalized_search_text, page_bounds, PageBounds};
 use crate::{
-    ChannelScope, SearchError, SearchHit, SearchMode, SearchQuery, SearchResult, SearchSort,
+    ChannelScope, ScoreParts, ScoredHit, ScoredResult, SearchError, SearchHit, SearchQuery,
+    SearchResult, SearchSort,
 };
 
 /// Mapping version this code writes and searches. Bump it, with a reindex,
-/// whenever the mapping or analysis changes.
-const MAPPING_VERSION: u32 = 1;
+/// whenever the mapping or analysis changes. Until reindexing exists, an
+/// index of an older version is deleted, recreated and backfilled again.
+///
+/// 2: word parts, accent folding, stems, prefixes and recency.
+pub const MAPPING_VERSION: u32 = 2;
 
 /// Index names used when the configuration sets no prefix.
 pub const DEFAULT_INDEX_PREFIX: &str = "buzz-";
@@ -146,9 +153,12 @@ impl SearchIndex {
     }
 
     /// Create the versioned index behind the alias unless the alias exists.
-    /// Returns whether this call created it.
+    /// Returns whether this call created it. An alias pointing anywhere but
+    /// this mapping version's index is an error, so the indexer, which calls
+    /// this before every pass, never writes documents of one mapping into an
+    /// index of another.
     pub async fn ensure(&self) -> Result<bool, SearchError> {
-        if self.alias_exists().await? {
+        if self.alias_checked().await? {
             return Ok(false);
         }
         let response = self
@@ -163,7 +173,7 @@ impl SearchIndex {
         if response.status_code().as_u16() == 400 {
             let body: Value = response.json().await.map_err(transport_error)?;
             if body["error"]["type"] == "resource_already_exists_exception" {
-                if self.alias_exists().await? {
+                if self.alias_checked().await? {
                     return Ok(false);
                 }
                 return Err(SearchError::Engine("index exists without its alias".into()));
@@ -173,15 +183,33 @@ impl SearchIndex {
         checked(response).await.map(|_| true)
     }
 
-    async fn alias_exists(&self) -> Result<bool, SearchError> {
+    /// Whether the alias exists, failing if it points at anything but this
+    /// version's index.
+    async fn alias_checked(&self) -> Result<bool, SearchError> {
         let response = self
             .client
             .indices()
-            .exists(IndicesExistsParts::Index(&[&self.alias]))
+            .get_alias(IndicesGetAliasParts::Name(&[&self.alias]))
             .send()
             .await
             .map_err(transport_error)?;
-        Ok(response.status_code().is_success())
+        if response.status_code().as_u16() == 404 {
+            return Ok(false);
+        }
+        let body = checked(response).await?;
+        let targets: Vec<&String> = body
+            .as_object()
+            .into_iter()
+            .flat_map(|m| m.keys())
+            .collect();
+        if targets != [&self.index] {
+            return Err(SearchError::Engine(format!(
+                "alias {} points at {targets:?}, not {}: delete that index and the \
+                 search_backfill rows to rebuild it at this version",
+                self.alias, self.index
+            )));
+        }
+        Ok(true)
     }
 
     /// Delete the versioned index. For tests and tools.
@@ -362,27 +390,51 @@ impl SearchIndex {
 
     /// Run a message search against the alias.
     pub(crate) async fn search(&self, query: &SearchQuery) -> Result<SearchResult, SearchError> {
+        self.search_scored(query).await.map(Into::into)
+    }
+
+    /// Run a message search against the alias, keeping each hit's score
+    /// parts.
+    pub(crate) async fn search_scored(
+        &self,
+        query: &SearchQuery,
+    ) -> Result<ScoredResult, SearchError> {
         let PageBounds {
             page,
             per_page,
             offset,
         } = page_bounds(query);
-        let Some(text) = normalized_search_text(&query.q) else {
-            return Ok(SearchResult {
+        let empty = || {
+            Ok(ScoredResult {
                 hits: Vec::new(),
                 page,
-            });
+            })
+        };
+        let Some(text) = normalized_search_text(&query.q)
+            .and_then(|text| relevance::text_query(&text, query.mode))
+        else {
+            return empty();
         };
         if offset + i64::from(per_page) > MAX_RESULT_WINDOW {
-            return Ok(SearchResult {
-                hits: Vec::new(),
-                page,
-            });
+            return empty();
         }
+        let rescored = query.sort == SearchSort::Relevance;
+        // Relevance results end at the rescore window: hits past it keep Q
+        // without the age factor, so a page reaching past it would mix them
+        // with the window's and repeat or skip hits of other pages.
+        let size = if rescored {
+            (relevance::RESCORE_WINDOW - offset).min(i64::from(per_page))
+        } else {
+            i64::from(per_page)
+        };
+        let Ok(size @ 1..) = u32::try_from(size) else {
+            return empty();
+        };
+        let now = chrono::Utc::now().timestamp();
         let response = self
             .client
             .search(SearchParts::Index(&[&self.alias]))
-            .body(search_body(query, &text, offset, per_page))
+            .body(search_body(query, text, offset, size, now))
             .send()
             .await
             .map_err(transport_error)?;
@@ -398,16 +450,36 @@ impl SearchIndex {
             .as_array()
             .into_iter()
             .flatten()
-            .map(parse_hit)
-            .collect::<Result<_, _>>()?;
-        Ok(SearchResult { hits, page })
+            .map(|hit| {
+                let hit = parse_hit(hit)?;
+                let age = relevance::age_factor(hit.created_at, now);
+                // Every relevance hit is in the rescore window, so its rank
+                // carries the age factor.
+                let query_match = if rescored {
+                    (f64::from(hit.rank) / age) as f32
+                } else {
+                    hit.rank
+                };
+                Ok(ScoredHit {
+                    hit,
+                    parts: ScoreParts {
+                        query_match,
+                        age: age as f32,
+                    },
+                })
+            })
+            .collect::<Result<_, SearchError>>()?;
+        Ok(ScoredResult { hits, page })
     }
 }
 
 /// Settings, mapping and alias of a new index.
 fn index_definition(alias: &str) -> Value {
     json!({
-        "settings": { "index": { "refresh_interval": "30s" } },
+        "settings": {
+            "index": { "refresh_interval": "30s" },
+            "analysis": relevance::analysis()
+        },
         "mappings": {
             "dynamic": "strict",
             "_source": { "excludes": ["content"] },
@@ -422,7 +494,7 @@ fn index_definition(alias: &str) -> Value {
                 "thread_root": { "type": "keyword" },
                 "mentions": { "type": "keyword" },
                 "created_at": { "type": "date", "format": "epoch_second" },
-                "content": { "type": "text" }
+                "content": relevance::content_mapping()
             }
         },
         "aliases": { alias: {} }
@@ -488,8 +560,16 @@ fn document_source(community: CommunityId, document: &SearchDocument) -> Value {
 }
 
 /// The request body of a search: filters on the community first, then on
-/// scope, kinds, authors and time; the text must match every word.
-fn search_body(query: &SearchQuery, text: &str, offset: i64, per_page: u32) -> Value {
+/// scope, kinds, authors and time; `text` decides what matches and its Q.
+/// Relevance order is Q times the age factor at `now`; newest order is by
+/// time alone.
+fn search_body(
+    query: &SearchQuery,
+    text: relevance::TextQuery,
+    offset: i64,
+    per_page: u32,
+    now: i64,
+) -> Value {
     let mut filter =
         vec![json!({ "term": { "community": query.community.as_uuid().to_string() } })];
     let channels = |ids: &[uuid::Uuid]| json!({ "terms": { "channel": ids.iter().map(|id| id.to_string()).collect::<Vec<_>>() } });
@@ -519,31 +599,24 @@ fn search_body(query: &SearchQuery, text: &str, offset: i64, per_page: u32) -> V
     if !range.is_empty() {
         filter.push(json!({ "range": { "created_at": range } }));
     }
-    let text_match = match query.mode {
-        SearchMode::FullText => {
-            json!({ "match": { "content": { "query": text, "operator": "and" } } })
-        }
-        SearchMode::Prefix => {
-            json!({ "match_bool_prefix": { "content": { "query": text, "operator": "and" } } })
-        }
-    };
-    let tiebreak = [
-        json!({ "created_at": "desc" }),
-        json!({ "event_id": "asc" }),
-    ];
-    let sort: Vec<Value> = match query.sort {
-        SearchSort::Relevance => std::iter::once(json!("_score")).chain(tiebreak).collect(),
-        SearchSort::Newest => tiebreak.into(),
-    };
-    json!({
+    let mut body = json!({
         "from": offset,
         "size": per_page,
+        // No hit count: counting would visit every match.
         "track_total_hits": false,
-        "track_scores": true,
         "_source": ["event_id", "kind", "author", "channel", "created_at"],
-        "query": { "bool": { "filter": filter, "must": [text_match] } },
-        "sort": sort
-    })
+        "query": { "bool": { "filter": filter, "must": [text.matched.clone()] } },
+    });
+    match query.sort {
+        // A rescore cannot follow a sort, so ties keep the engine's order;
+        // the age factor already puts the newer of two equal matches first.
+        SearchSort::Relevance => body["rescore"] = relevance::rescore(&text, now),
+        SearchSort::Newest => {
+            body["sort"] = json!([{ "created_at": "desc" }, { "event_id": "asc" }]);
+            body["track_scores"] = json!(true);
+        }
+    }
+    body
 }
 
 fn parse_hit(hit: &Value) -> Result<SearchHit, SearchError> {
