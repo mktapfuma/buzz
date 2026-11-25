@@ -42,6 +42,9 @@ class SignedEventRelay {
     FutureOr<void> Function(NostrEvent event)? onSigned,
     Future<bool> Function()? mayPublish,
   }) async {
+    // Taken before the first await, while the caller is still on the stack: a
+    // caller that doesn't await this call is gone from it afterwards.
+    final callSite = StackTrace.current;
     final nsec = _nsec;
     if (nsec == null || nsec.isEmpty) {
       throw Exception('Cannot submit event: no signing key available');
@@ -64,7 +67,12 @@ class SignedEventRelay {
     // Durable callers must finish journaling the exact signed bytes before
     // the relay can accept an event whose acknowledgement might be lost.
     await onSigned?.call(nostrEvent);
-    return _session.publish(nostrEvent, mayPublish: mayPublish);
+    try {
+      return await _session.publish(nostrEvent, mayPublish: mayPublish);
+    } on RelayCallError catch (error) {
+      // The session's own call site starts after the wait for `onSigned`.
+      Error.throwWithStackTrace(error, trimCallSite(callSite));
+    }
   }
 }
 
@@ -132,7 +140,7 @@ Future<NostrEvent> submitSignedEventOnce({
               operation: DiagnosticOperation.relayRejection,
             );
           }
-          result.completeError(_SignedEventRejection(detail), callSite);
+          result.completeErrorAt(_SignedEventRejection(detail), callSite);
         }
       }
     },
@@ -144,7 +152,7 @@ Future<NostrEvent> submitSignedEventOnce({
       // The socket's own authentication deadline is shorter than [timeout],
       // so its plain timeout is typed here as this call's.
       if (error is TimeoutException && error is! RelayCallError) {
-        result.completeError(
+        result.completeErrorAt(
           RelayTimeoutException(
             RelayCall.publish,
             error.message ?? 'Relay did not answer',
@@ -154,7 +162,10 @@ Future<NostrEvent> submitSignedEventOnce({
         );
         return;
       }
-      result.completeError(error ?? Exception('Relay disconnected'), callSite);
+      result.completeErrorAt(
+        error ?? Exception('Relay disconnected'),
+        callSite,
+      );
     },
   );
   socket.headers = headers;
@@ -164,7 +175,7 @@ Future<NostrEvent> submitSignedEventOnce({
   // zone as an uncaught error.
   final deadline = Timer(timeout, () {
     if (result.isCompleted) return;
-    result.completeError(
+    result.completeErrorAt(
       RelayTimeoutException(
         RelayCall.publish,
         'Relay did not answer within $timeout',
